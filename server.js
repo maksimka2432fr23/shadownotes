@@ -16,7 +16,7 @@ app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // In-memory storage for notes
-// Structure: Map<noteId, { content, passwordHash, createdAt, expiresAt, burnOnRead, views }>
+// Structure: Map<noteId, { content, passwordHash, passwordSalt, createdAt, expiresAt, burnOnRead, views, failedAttempts, lockUntil }>
 const notes = new Map();
 
 // Cleanup interval - remove expired notes every minute
@@ -48,16 +48,13 @@ function decrypt(ciphertext, key) {
     return bytes.toString(CryptoJS.enc.Utf8);
 }
 
-function hashPassword(password) {
-    return CryptoJS.SHA256(password).toString();
+function hashPassword(password, salt) {
+    return crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
 }
 
 function validateTTL(ttl) {
-    const validOptions = [10, 60, 1440]; // minutes: 10min, 1hour, 24hours
-    if (typeof ttl === 'number' && ttl > 0 && ttl <= 10080) { // max 7 days
-        return ttl;
-    }
-    return 60; // default 1 hour
+    const validOptions = [10, 60, 1440, 10080]; // minutes: 10min, 1hour, 24hours, 7 days
+    return validOptions.includes(ttl) ? ttl : 60;
 }
 
 // API Routes
@@ -83,20 +80,25 @@ app.post('/api/notes', (req, res) => {
         // Encrypt content if password provided, otherwise store as-is
         let storedContent = content;
         let passwordHash = null;
+        let passwordSalt = null;
         
         if (password) {
             storedContent = encrypt(content, password);
-            passwordHash = hashPassword(password);
+            passwordSalt = crypto.randomBytes(16).toString('hex');
+            passwordHash = hashPassword(password, passwordSalt);
         }
         
         const note = {
             id: noteId,
             content: storedContent,
             passwordHash,
+            passwordSalt,
             createdAt: now,
             expiresAt,
             burnOnRead: Boolean(burnOnRead),
-            views: 0
+            views: 0,
+            failedAttempts: 0,
+            lockUntil: null
         };
         
         notes.set(noteId, note);
@@ -163,13 +165,23 @@ app.post('/api/notes/:id/read', (req, res) => {
             notes.delete(id);
             return res.status(404).json({ error: 'Note expired' });
         }
+
+        if (note.lockUntil && Date.now() < note.lockUntil) {
+            return res.status(429).json({ error: 'Too many attempts. Try again later.', code: 'TOO_MANY_ATTEMPTS' });
+        }
         
         // Check password if required
         if (note.passwordHash) {
-            const providedHash = password ? hashPassword(password) : null;
+            const providedHash = password ? hashPassword(password, note.passwordSalt) : null;
             if (providedHash !== note.passwordHash) {
-                return res.status(403).json({ error: 'Wrong password' });
+                note.failedAttempts += 1;
+                if (note.failedAttempts >= 5) {
+                    note.lockUntil = Date.now() + (5 * 60 * 1000);
+                }
+                return res.status(403).json({ error: 'Wrong password', code: 'WRONG_PASSWORD' });
             }
+            note.failedAttempts = 0;
+            note.lockUntil = null;
         }
         
         // Get the actual content (decrypt if needed)
@@ -199,6 +211,14 @@ app.post('/api/notes/:id/read', (req, res) => {
         console.error('[ERROR] Read note failed:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
+});
+
+// Error handler for JSON payload too large
+app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'Content too long (max 10KB)', code: 'PAYLOAD_TOO_LARGE' });
+    }
+    return next(err);
 });
 
 // Destroy note immediately
