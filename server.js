@@ -8,35 +8,46 @@ const crypto = require('crypto');
 const CryptoJS = require('crypto-js');
 const path = require('path');
 
+const cors = () => (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
+    }
+    return next();
+};
+
+const helmet = () => (req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'same-origin');
+    res.setHeader('X-DNS-Prefetch-Control', 'off');
+    return next();
+};
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
+app.use(cors());
+app.use(helmet());
 app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// In-memory storage for notes
-// Structure: Map<noteId, { content, passwordHash, passwordSalt, createdAt, expiresAt, burnOnRead, views, failedAttempts, lockUntil }>
 const notes = new Map();
+let redisClient = null;
 
-// Cleanup interval - remove expired notes every minute
-const CLEANUP_INTERVAL = 60000;
-
-setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    
-    for (const [id, note] of notes.entries()) {
-        if (note.expiresAt && now >= note.expiresAt) {
-            notes.delete(id);
-            cleaned++;
-        }
-    }
-    
-    if (cleaned > 0) {
-        console.log(`[GC] Cleaned ${cleaned} expired notes`);
-    }
-}, CLEANUP_INTERVAL);
+if (process.env.REDIS_URL) {
+    const { createClient } = require('redis');
+    redisClient = createClient({ url: process.env.REDIS_URL });
+    redisClient.on('error', (error) => {
+        console.error('[REDIS] Client error:', error);
+    });
+    redisClient.connect().catch((error) => {
+        console.error('[REDIS] Connection failed:', error);
+    });
+}
 
 // Helper functions
 function encrypt(text, key) {
@@ -57,19 +68,61 @@ function validateTTL(ttl) {
     return validOptions.includes(ttl) ? ttl : 60;
 }
 
+function sendError(res, status, code, error, details) {
+    const payload = { error };
+    if (code) {
+        payload.code = code;
+    }
+    if (details) {
+        payload.details = details;
+    }
+    return res.status(status).json(payload);
+}
+
+function getNoteKey(id) {
+    return `note:${id}`;
+}
+
+async function saveNote(note) {
+    if (redisClient) {
+        const ttlSeconds = Math.max(1, Math.floor((note.expiresAt - Date.now()) / 1000));
+        await redisClient.set(getNoteKey(note.id), JSON.stringify(note), {
+            EX: ttlSeconds
+        });
+        return;
+    }
+    notes.set(note.id, note);
+}
+
+async function getNote(id) {
+    if (redisClient) {
+        const payload = await redisClient.get(getNoteKey(id));
+        return payload ? JSON.parse(payload) : null;
+    }
+    return notes.get(id) || null;
+}
+
+async function deleteNote(id) {
+    if (redisClient) {
+        await redisClient.del(getNoteKey(id));
+        return;
+    }
+    notes.delete(id);
+}
+
 // API Routes
 
 // Create a new note
-app.post('/api/notes', (req, res) => {
+app.post('/api/notes', async (req, res) => {
     try {
         const { content, ttl = 60, burnOnRead = false, password = null } = req.body;
         
         if (!content || typeof content !== 'string') {
-            return res.status(400).json({ error: 'Content is required' });
+            return sendError(res, 400, 'INVALID_CONTENT', 'Content is required');
         }
         
         if (content.length > 10000) {
-            return res.status(400).json({ error: 'Content too long (max 10KB)' });
+            return sendError(res, 400, 'CONTENT_TOO_LONG', 'Content too long (max 10KB)');
         }
         
         const noteId = crypto.randomUUID();
@@ -101,7 +154,7 @@ app.post('/api/notes', (req, res) => {
             lockUntil: null
         };
         
-        notes.set(noteId, note);
+        await saveNote(note);
         
         const baseUrl = `${req.protocol}://${req.get('host')}`;
         
@@ -116,23 +169,23 @@ app.post('/api/notes', (req, res) => {
         
     } catch (error) {
         console.error('[ERROR] Create note failed:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error');
     }
 });
 
 // Check if note exists and get metadata (without revealing content)
-app.get('/api/notes/:id/metadata', (req, res) => {
+app.get('/api/notes/:id/metadata', async (req, res) => {
     try {
         const { id } = req.params;
-        const note = notes.get(id);
+        const note = await getNote(id);
         
         if (!note) {
-            return res.status(404).json({ error: 'Note not found' });
+            return sendError(res, 404, 'NOT_FOUND', 'Note not found');
         }
         
         if (note.expiresAt && Date.now() >= note.expiresAt) {
-            notes.delete(id);
-            return res.status(404).json({ error: 'Note expired' });
+            await deleteNote(id);
+            return sendError(res, 404, 'NOTE_EXPIRED', 'Note expired');
         }
         
         res.json({
@@ -145,29 +198,29 @@ app.get('/api/notes/:id/metadata', (req, res) => {
         
     } catch (error) {
         console.error('[ERROR] Metadata check failed:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error');
     }
 });
 
 // Read note content
-app.post('/api/notes/:id/read', (req, res) => {
+app.post('/api/notes/:id/read', async (req, res) => {
     try {
         const { id } = req.params;
         const { password } = req.body;
         
-        const note = notes.get(id);
+        const note = await getNote(id);
         
         if (!note) {
-            return res.status(404).json({ error: 'Note not found or already destroyed' });
+            return sendError(res, 404, 'NOT_FOUND', 'Note not found or already destroyed');
         }
         
         if (note.expiresAt && Date.now() >= note.expiresAt) {
-            notes.delete(id);
-            return res.status(404).json({ error: 'Note expired' });
+            await deleteNote(id);
+            return sendError(res, 404, 'NOTE_EXPIRED', 'Note expired');
         }
 
         if (note.lockUntil && Date.now() < note.lockUntil) {
-            return res.status(429).json({ error: 'Too many attempts. Try again later.', code: 'TOO_MANY_ATTEMPTS' });
+            return sendError(res, 429, 'TOO_MANY_ATTEMPTS', 'Too many attempts. Try again later.');
         }
         
         // Check password if required
@@ -178,7 +231,8 @@ app.post('/api/notes/:id/read', (req, res) => {
                 if (note.failedAttempts >= 5) {
                     note.lockUntil = Date.now() + (5 * 60 * 1000);
                 }
-                return res.status(403).json({ error: 'Wrong password', code: 'WRONG_PASSWORD' });
+                await saveNote(note);
+                return sendError(res, 403, 'WRONG_PASSWORD', 'Wrong password');
             }
             note.failedAttempts = 0;
             note.lockUntil = null;
@@ -194,10 +248,11 @@ app.post('/api/notes/:id/read', (req, res) => {
         const wasBurned = note.burnOnRead;
         
         if (note.burnOnRead) {
-            notes.delete(id);
+            await deleteNote(id);
             console.log(`[BURN] Note ${id} destroyed after reading`);
         } else {
             note.views++;
+            await saveNote(note);
             console.log(`[READ] Note ${id} viewed (${note.views} total)`);
         }
         
@@ -209,43 +264,44 @@ app.post('/api/notes/:id/read', (req, res) => {
         
     } catch (error) {
         console.error('[ERROR] Read note failed:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error');
     }
 });
 
 // Error handler for JSON payload too large
 app.use((err, req, res, next) => {
     if (err && err.type === 'entity.too.large') {
-        return res.status(413).json({ error: 'Content too long (max 10KB)', code: 'PAYLOAD_TOO_LARGE' });
+        return sendError(res, 413, 'PAYLOAD_TOO_LARGE', 'Content too long (max 10KB)');
     }
     return next(err);
 });
 
 // Destroy note immediately
-app.delete('/api/notes/:id', (req, res) => {
+app.delete('/api/notes/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const note = notes.get(id);
+        const note = await getNote(id);
         
         if (!note) {
-            return res.status(404).json({ error: 'Note not found' });
+            return sendError(res, 404, 'NOT_FOUND', 'Note not found');
         }
         
-        notes.delete(id);
+        await deleteNote(id);
         console.log(`[DESTROY] Note ${id} manually destroyed`);
         
         res.json({ success: true });
         
     } catch (error) {
         console.error('[ERROR] Destroy note failed:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error');
     }
 });
 
 // Stats endpoint (for debugging/admin)
-app.get('/api/stats', (req, res) => {
+app.get('/api/stats', async (req, res) => {
+    const totalNotes = redisClient ? await redisClient.dbSize() : notes.size;
     res.json({
-        totalNotes: notes.size,
+        totalNotes,
         uptime: process.uptime()
     });
 });

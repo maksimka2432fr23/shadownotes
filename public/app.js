@@ -96,6 +96,12 @@
     }
 
     // ===== API Functions =====
+    function createRequestError(message, code) {
+        const requestError = new Error(message);
+        requestError.code = code;
+        return requestError;
+    }
+
     async function apiCreateNote(data) {
         const response = await fetch('/api/notes', {
             method: 'POST',
@@ -116,9 +122,7 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            const requestError = new Error(error.error || 'Failed to create note');
-            requestError.code = error.code;
-            throw requestError;
+            throw createRequestError(error.error || 'Failed to create note', error.code);
         }
         
         return response.json();
@@ -138,7 +142,7 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Note not found' }));
-            throw new Error(error.error || 'Note not found');
+            throw createRequestError(error.error || 'Note not found', error.code);
         }
         
         return response.json();
@@ -163,9 +167,7 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            const requestError = new Error(error.error || 'Failed to read note');
-            requestError.code = error.code;
-            throw requestError;
+            throw createRequestError(error.error || 'Failed to read note', error.code);
         }
         
         return response.json();
@@ -187,9 +189,7 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            const requestError = new Error(error.error || 'Failed to destroy note');
-            requestError.code = error.code;
-            throw requestError;
+            throw createRequestError(error.error || 'Failed to destroy note', error.code);
         }
         
         return response.json();
