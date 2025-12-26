@@ -116,7 +116,9 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            throw new Error(error.error || 'Failed to create note');
+            const requestError = new Error(error.error || 'Failed to create note');
+            requestError.code = error.code;
+            throw requestError;
         }
         
         return response.json();
@@ -161,7 +163,9 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            throw new Error(error.error || 'Failed to read note');
+            const requestError = new Error(error.error || 'Failed to read note');
+            requestError.code = error.code;
+            throw requestError;
         }
         
         return response.json();
@@ -183,7 +187,9 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            throw new Error(error.error || 'Failed to destroy note');
+            const requestError = new Error(error.error || 'Failed to destroy note');
+            requestError.code = error.code;
+            throw requestError;
         }
         
         return response.json();
@@ -270,11 +276,14 @@
             showView('content');
             
         } catch (error) {
-            if (error.message === 'Wrong password') {
+            if (error.code === 'WRONG_PASSWORD') {
                 elements.passwordError.textContent = 'Неверный пароль';
                 elements.passwordError.classList.remove('hidden');
                 elements.inputs.readPassword.value = '';
                 elements.inputs.readPassword.focus();
+            } else if (error.code === 'TOO_MANY_ATTEMPTS') {
+                elements.passwordError.textContent = 'Слишком много попыток. Повторите позже.';
+                elements.passwordError.classList.remove('hidden');
             } else {
                 showError(error.message);
             }
@@ -374,7 +383,11 @@
                 showView('created');
                 
             } catch (error) {
-                alert('Ошибка: ' + error.message);
+                if (error.code === 'PAYLOAD_TOO_LARGE') {
+                    alert('Текст слишком длинный. Максимум 10KB.');
+                } else {
+                    alert('Ошибка: ' + error.message);
+                }
             } finally {
                 btn.disabled = false;
                 btnText.classList.remove('hidden');
