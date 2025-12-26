@@ -277,6 +277,19 @@ select {
     text-align: right;
 }
 
+.form-hint {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.form-hint.warning {
+    color: var(--warning);
+}
+
+.form-hint.hidden {
+    display: none;
+}
+
 /* Toggle Switch */
 .toggle-wrapper {
     display: flex;
@@ -646,6 +659,13 @@ select {
 
 #destroy-message {
     color: var(--text-secondary);
+}
+
+.content-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
 }
 
 /* ===== Error View ===== */

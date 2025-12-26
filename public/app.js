@@ -12,8 +12,11 @@
         noteId: null,
         requiresPassword: false,
         burnOnRead: false,
-        expiresAt: null
+        expiresAt: null,
+        expiresInterval: null
     };
+
+    const API_BASE = '/api/v1';
 
     // ===== DOM Elements =====
     const elements = {};
@@ -48,7 +51,9 @@
             create: document.getElementById('create-btn'),
             copy: document.getElementById('copy-btn'),
             destroy: document.getElementById('destroy-btn'),
-            reveal: document.getElementById('reveal-btn')
+            reveal: document.getElementById('reveal-btn'),
+            copyContent: document.getElementById('copy-content-btn'),
+            destroyAfterRead: document.getElementById('destroy-after-read-btn')
         };
         
         elements.charCount = document.getElementById('char-count');
@@ -58,6 +63,7 @@
         elements.burnedBadge = document.getElementById('burned-badge');
         elements.burnModeText = document.getElementById('burn-mode-text');
         elements.destroyMessage = document.getElementById('destroy-message');
+        elements.passwordWarning = document.getElementById('password-warning');
     }
 
     // ===== Views Management =====
@@ -72,6 +78,10 @@
         if (targetView) {
             targetView.classList.add('active');
             state.currentView = viewName;
+        }
+
+        if (['create', 'created', 'error'].includes(viewName)) {
+            clearExpiresTicker();
         }
     }
 
@@ -96,8 +106,15 @@
     }
 
     // ===== API Functions =====
+    function createRequestError(error, fallbackMessage) {
+        const requestError = new Error(error.error || fallbackMessage);
+        requestError.code = error.code;
+        requestError.details = error.details;
+        return requestError;
+    }
+
     async function apiCreateNote(data) {
-        const response = await fetch('/api/notes', {
+        const response = await fetch(`${API_BASE}/notes`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
@@ -116,14 +133,14 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            throw new Error(error.error || 'Failed to create note');
+            throw createRequestError(error, 'Failed to create note');
         }
         
         return response.json();
     }
 
     async function apiGetMetadata(noteId) {
-        const response = await fetch(`/api/notes/${noteId}/metadata`);
+        const response = await fetch(`${API_BASE}/notes/${noteId}/metadata`);
         
         const contentType = response.headers.get('content-type');
         if (!contentType || !contentType.includes('application/json')) {
@@ -136,7 +153,7 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Note not found' }));
-            throw new Error(error.error || 'Note not found');
+            throw createRequestError(error, 'Note not found');
         }
         
         return response.json();
@@ -144,7 +161,7 @@
 
     async function apiReadNote(noteId, password = null) {
         const body = password ? { password } : {};
-        const response = await fetch(`/api/notes/${noteId}/read`, {
+        const response = await fetch(`${API_BASE}/notes/${noteId}/read`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
@@ -161,14 +178,14 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            throw new Error(error.error || 'Failed to read note');
+            throw createRequestError(error, 'Failed to read note');
         }
         
         return response.json();
     }
 
     async function apiDestroyNote(noteId) {
-        const response = await fetch(`/api/notes/${noteId}`, {
+        const response = await fetch(`${API_BASE}/notes/${noteId}`, {
             method: 'DELETE'
         });
         
@@ -183,7 +200,7 @@
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Request failed' }));
-            throw new Error(error.error || 'Failed to destroy note');
+            throw createRequestError(error, 'Failed to destroy note');
         }
         
         return response.json();
@@ -201,7 +218,7 @@
             state.expiresAt = metadata.expiresAt;
             
             // Update expires time display
-            updateExpiresTime(metadata.expiresAt);
+            startExpiresTicker();
             
             // Update burn mode text
             if (state.burnOnRead) {
@@ -250,6 +267,19 @@
         }
     }
 
+    function clearExpiresTicker() {
+        if (state.expiresInterval) {
+            clearInterval(state.expiresInterval);
+            state.expiresInterval = null;
+        }
+    }
+
+    function startExpiresTicker() {
+        clearExpiresTicker();
+        updateExpiresTime(state.expiresAt);
+        state.expiresInterval = setInterval(() => updateExpiresTime(state.expiresAt), 60000);
+    }
+
     // ===== Show Content =====
     async function revealContent(password = null) {
         try {
@@ -262,19 +292,24 @@
             if (result.burned) {
                 elements.burnedBadge.style.display = 'inline-block';
                 elements.destroyMessage.textContent = 'Эта заметка была безвозвратно удалена и больше недоступна';
+                elements.buttons.destroyAfterRead.style.display = 'none';
             } else {
                 elements.burnedBadge.style.display = 'none';
                 elements.destroyMessage.textContent = 'Заметка будет автоматически удалена по истечении времени';
+                elements.buttons.destroyAfterRead.style.display = 'inline-flex';
             }
             
             showView('content');
             
         } catch (error) {
-            if (error.message === 'Wrong password') {
+            if (error.code === 'WRONG_PASSWORD') {
                 elements.passwordError.textContent = 'Неверный пароль';
                 elements.passwordError.classList.remove('hidden');
                 elements.inputs.readPassword.value = '';
                 elements.inputs.readPassword.focus();
+            } else if (error.code === 'TOO_MANY_ATTEMPTS') {
+                elements.passwordError.textContent = 'Слишком много попыток. Повторите позже.';
+                elements.passwordError.classList.remove('hidden');
             } else {
                 showError(error.message);
             }
@@ -318,6 +353,30 @@
         }
     }
 
+    async function copyContent() {
+        const content = elements.noteText.textContent;
+        if (!content) {
+            return;
+        }
+
+        try {
+            await navigator.clipboard.writeText(content);
+            const copyBtn = elements.buttons.copyContent;
+            const copyText = copyBtn.querySelector('span');
+            const originalText = copyText.textContent;
+
+            copyBtn.classList.add('copied');
+            copyText.textContent = 'Скопировано!';
+
+            setTimeout(() => {
+                copyBtn.classList.remove('copied');
+                copyText.textContent = originalText;
+            }, 2000);
+        } catch (error) {
+            alert('Не удалось скопировать содержимое');
+        }
+    }
+
     // ===== Destroy Note =====
     async function destroyNote() {
         if (!confirm('Вы уверены? Заметка будет удалена безвозвратно.')) {
@@ -332,12 +391,45 @@
         }
     }
 
+    async function destroyAfterRead() {
+        if (!confirm('Удалить заметку сейчас?')) {
+            return;
+        }
+
+        try {
+            await apiDestroyNote(state.noteId);
+            elements.destroyMessage.textContent = 'Заметка была удалена и больше недоступна';
+            elements.burnedBadge.style.display = 'inline-block';
+            elements.buttons.destroyAfterRead.style.display = 'none';
+        } catch (error) {
+            showError('Не удалось уничтожить заметку');
+        }
+    }
+
+    function isWeakPassword(password) {
+        if (!password) {
+            return false;
+        }
+        const hasNumber = /\\d/.test(password);
+        const hasLetter = /[a-zA-Zа-яА-Я]/.test(password);
+        return password.length < 8 || !(hasNumber && hasLetter);
+    }
+
     // ===== Event Handlers =====
     function initEventListeners() {
         // Character count for textarea
         elements.inputs.content.addEventListener('input', () => {
             const count = elements.inputs.content.value.length;
             elements.charCount.textContent = count;
+        });
+
+        elements.inputs.password.addEventListener('input', () => {
+            const password = elements.inputs.password.value;
+            if (isWeakPassword(password)) {
+                elements.passwordWarning.classList.remove('hidden');
+            } else {
+                elements.passwordWarning.classList.add('hidden');
+            }
         });
         
         // Create form submission
@@ -374,7 +466,11 @@
                 showView('created');
                 
             } catch (error) {
-                alert('Ошибка: ' + error.message);
+                if (error.code === 'PAYLOAD_TOO_LARGE') {
+                    alert('Текст слишком длинный. Максимум 10KB.');
+                } else {
+                    alert('Ошибка: ' + error.message);
+                }
             } finally {
                 btn.disabled = false;
                 btnText.classList.remove('hidden');
@@ -384,9 +480,15 @@
         
         // Copy button
         elements.buttons.copy.addEventListener('click', copyLink);
+
+        // Copy content button
+        elements.buttons.copyContent.addEventListener('click', copyContent);
         
         // Destroy button
         elements.buttons.destroy.addEventListener('click', destroyNote);
+
+        // Destroy after read button
+        elements.buttons.destroyAfterRead.addEventListener('click', destroyAfterRead);
         
         // Password form submission
         elements.forms.password.addEventListener('submit', (e) => {
